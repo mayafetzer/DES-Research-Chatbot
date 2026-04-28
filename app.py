@@ -1,25 +1,29 @@
 import streamlit as st
-import torch
 import numpy as np
 import faiss
-from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from sentence_transformers import SentenceTransformer
 from pypdf import PdfReader
 
 # ================================
-# LOAD MODELS (cache for speed)
+# PAGE CONFIG
+# ================================
+st.set_page_config(page_title="DES Research Chatbot", layout="wide")
+
+# ================================
+# LOAD MODELS (SAFE FOR CLOUD)
 # ================================
 @st.cache_resource
 def load_models():
     embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
-    model_name = "microsoft/phi-2"  # or your chosen model
+    model_name = "google/flan-t5-small"  # lightweight + fast
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.float32,
-        device_map="auto"
-    )
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+
+    model.to("cpu")  # force CPU
 
     return embedder, tokenizer, model
 
@@ -27,9 +31,9 @@ def load_models():
 # ================================
 # PDF PROCESSING
 # ================================
-def extract_text_from_pdfs(uploaded_files):
+def extract_text_from_pdfs(files):
     text = ""
-    for file in uploaded_files:
+    for file in files:
         reader = PdfReader(file)
         for page in reader.pages:
             text += page.extract_text() or ""
@@ -39,10 +43,12 @@ def extract_text_from_pdfs(uploaded_files):
 def chunk_text(text, chunk_size=500, overlap=50):
     chunks = []
     start = 0
+
     while start < len(text):
         end = start + chunk_size
         chunks.append(text[start:end])
         start += chunk_size - overlap
+
     return chunks
 
 
@@ -51,12 +57,12 @@ def chunk_text(text, chunk_size=500, overlap=50):
 # ================================
 def create_vector_store(chunks, embedder):
     embeddings = embedder.encode(chunks)
-    dim = embeddings.shape[1]
 
-    index = faiss.IndexFlatL2(dim)
+    dimension = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dimension)
     index.add(np.array(embeddings))
 
-    return index, embeddings
+    return index
 
 
 def retrieve(query, embedder, index, chunks, k=3):
@@ -67,13 +73,11 @@ def retrieve(query, embedder, index, chunks, k=3):
 
 
 # ================================
-# GENERATE RESPONSE
+# GENERATE RESPONSE (FLAN-T5 STYLE)
 # ================================
 def generate_response(query, context, tokenizer, model):
     prompt = f"""
-You are a research assistant specializing in Deep Eutectic Solvents (DES).
-
-Use the context below to answer the question.
+Answer the question based only on the context below.
 
 Context:
 {context}
@@ -84,12 +88,11 @@ Question:
 Answer:
 """
 
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to("cpu")
 
     outputs = model.generate(
         **inputs,
-        max_new_tokens=300,
-        do_sample=True,
+        max_new_tokens=200,
         temperature=0.7
     )
 
@@ -97,12 +100,9 @@ Answer:
 
 
 # ================================
-# STREAMLIT UI
+# UI
 # ================================
-st.set_page_config(page_title="DES Research Chatbot")
-
 st.title("🧪 DES Research Chatbot")
-
 st.write("Upload research papers and ask questions.")
 
 embedder, tokenizer, model = load_models()
@@ -112,7 +112,12 @@ if "index" not in st.session_state:
     st.session_state.index = None
     st.session_state.chunks = None
 
-# File upload
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# ================================
+# FILE UPLOAD
+# ================================
 uploaded_files = st.file_uploader(
     "Upload PDF papers",
     type="pdf",
@@ -121,36 +126,64 @@ uploaded_files = st.file_uploader(
 
 if uploaded_files:
     with st.spinner("Processing PDFs..."):
-        text = extract_text_from_pdfs(uploaded_files)
-        chunks = chunk_text(text)
+        try:
+            text = extract_text_from_pdfs(uploaded_files)
 
-        index, embeddings = create_vector_store(chunks, embedder)
+            if not text.strip():
+                st.error("No readable text found in PDFs.")
+            else:
+                chunks = chunk_text(text)
+                index = create_vector_store(chunks, embedder)
 
-        st.session_state.index = index
-        st.session_state.chunks = chunks
+                st.session_state.index = index
+                st.session_state.chunks = chunks
 
-    st.success("Documents processed!")
+                st.success("Documents processed!")
+        except Exception as e:
+            st.error(f"Error processing files: {e}")
 
-# Chat input
-query = st.text_input("Ask a question about your papers:")
+# ================================
+# CHAT INTERFACE
+# ================================
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.write(msg["content"])
 
-if query and st.session_state.index is not None:
-    with st.spinner("Thinking..."):
-        retrieved_chunks = retrieve(
-            query,
-            embedder,
-            st.session_state.index,
-            st.session_state.chunks
-        )
+query = st.chat_input("Ask a question about your papers...")
 
-        context = "\n\n".join(retrieved_chunks)
+if query:
+    # Save user message
+    st.session_state.messages.append({"role": "user", "content": query})
 
-        response = generate_response(
-            query,
-            context,
-            tokenizer,
-            model
-        )
+    with st.chat_message("user"):
+        st.write(query)
 
-    st.subheader("Answer")
-    st.write(response)
+    if st.session_state.index is None:
+        response = "Please upload and process PDFs first."
+    else:
+        with st.spinner("Thinking..."):
+            try:
+                retrieved_chunks = retrieve(
+                    query,
+                    embedder,
+                    st.session_state.index,
+                    st.session_state.chunks
+                )
+
+                context = "\n\n".join(retrieved_chunks)
+
+                response = generate_response(
+                    query,
+                    context,
+                    tokenizer,
+                    model
+                )
+
+            except Exception as e:
+                response = f"Error: {e}"
+
+    # Save assistant response
+    st.session_state.messages.append({"role": "assistant", "content": response})
+
+    with st.chat_message("assistant"):
+        st.write(response)
