@@ -1,117 +1,102 @@
 import streamlit as st
+import torch
 import numpy as np
 import faiss
-import re
-
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from sentence_transformers import SentenceTransformer
 from pypdf import PdfReader
 
 # ================================
-# PAGE CONFIG
+# DEVICE
 # ================================
-st.set_page_config(page_title="DES Research Chatbot", layout="wide")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+st.set_page_config(page_title="PDF RAG Chatbot", layout="wide")
+st.title("📄 PDF Research Chatbot (RAG + LLM)")
 
 # ================================
-# LOAD MODELS
+# CACHE MODELS
 # ================================
 @st.cache_resource
-def load_models():
-    embedder = SentenceTransformer("all-MiniLM-L6-v2")
+def load_embedding_model():
+    return SentenceTransformer("all-MiniLM-L6-v2")
 
-    model_name = "google/flan-t5-small"
+
+@st.cache_resource
+def load_llm():
+    model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
 
-    return embedder, tokenizer, model
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(model_name)
+    model.to(device)
+
+    return tokenizer, model
+
+
+embedding_model = load_embedding_model()
+tokenizer, model = load_llm()
 
 
 # ================================
-# PDF CLEANING
+# PDF PROCESSING
 # ================================
-def clean_text(text):
-    # Remove references section (common issue)
-    text = re.split(r"(?i)references", text)[0]
-
-    # Remove excessive whitespace
-    text = re.sub(r"\s+", " ", text)
-
-    # Remove weird artifacts
-    text = text.replace("\n", " ")
-
-    return text.strip()
-
-
-def extract_text_from_pdfs(files):
+def extract_text_from_pdfs(pdf_files):
     text = ""
-
-    for file in files:
+    for file in pdf_files:
         reader = PdfReader(file)
         for page in reader.pages:
-            content = page.extract_text()
-            if content:
-                text += content + "\n"
-
-    return clean_text(text)
+            if page.extract_text():
+                text += page.extract_text()
+    return text
 
 
-# ================================
-# SMART CHUNKING
-# ================================
-def chunk_text(text, chunk_size=400, overlap=100):
-    sentences = re.split(r'(?<=[.!?]) +', text)
-
+def chunk_text(text, chunk_size=500, overlap=100):
     chunks = []
-    current_chunk = ""
-
-    for sentence in sentences:
-        if len(current_chunk) + len(sentence) < chunk_size:
-            current_chunk += sentence + " "
-        else:
-            chunks.append(current_chunk.strip())
-            current_chunk = sentence + " "
-
-    if current_chunk:
-        chunks.append(current_chunk.strip())
-
+    start = 0
+    while start < len(text):
+        chunks.append(text[start:start + chunk_size])
+        start += chunk_size - overlap
     return chunks
 
 
 # ================================
-# VECTOR STORE
+# BUILD VECTOR DB
 # ================================
-def create_vector_store(chunks, embedder):
-    embeddings = embedder.encode(chunks, show_progress_bar=True)
-
+def build_faiss_index(chunks):
+    embeddings = embedding_model.encode(chunks)
     dimension = embeddings.shape[1]
+
     index = faiss.IndexFlatL2(dimension)
     index.add(np.array(embeddings))
 
-    return index, embeddings
-
-
-def retrieve(query, embedder, index, chunks, k=5):
-    query_vec = embedder.encode([query])
-    distances, indices = index.search(np.array(query_vec), k)
-
-    retrieved = [chunks[i] for i in indices[0]]
-
-    # Filter out very short/noisy chunks
-    retrieved = [c for c in retrieved if len(c) > 50]
-
-    return retrieved
+    return index, chunks
 
 
 # ================================
-# GENERATE RESPONSE
+# RETRIEVAL
 # ================================
-def generate_response(query, context, tokenizer, model):
+def retrieve(query, index, chunks, top_k=3):
+    query_embedding = embedding_model.encode([query])
+    distances, indices = index.search(np.array(query_embedding), top_k)
+    return [chunks[i] for i in indices[0]]
+
+
+# ================================
+# CHAT FUNCTION
+# ================================
+def generate_answer(query, index, chunks):
+
+    context_chunks = retrieve(query, index, chunks)
+    context = "\n\n".join(context_chunks)
+
     prompt = f"""
 You are a scientific research assistant.
 
-Answer ONLY using the provided context.
-If the answer is not in the context, say:
-"I don't know based on the provided documents."
+Use ONLY the provided context from the paper to answer.
+If not found, say: "The paper does not provide this information."
 
 Context:
 {context}
@@ -122,99 +107,70 @@ Question:
 Answer:
 """
 
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True)
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=200,
-        temperature=0.3  # lower = more factual
-    )
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=200,
+            temperature=0.7,
+            do_sample=True,
+            pad_token_id=tokenizer.eos_token_id
+        )
 
-    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
+    return response[len(prompt):].strip()
 
-# ================================
-# UI
-# ================================
-st.title("🧪 DES Research Chatbot")
-st.write("Upload research papers and ask questions.")
-
-embedder, tokenizer, model = load_models()
-
-# Session state
-if "index" not in st.session_state:
-    st.session_state.index = None
-    st.session_state.chunks = None
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []
 
 # ================================
-# FILE UPLOAD
+# SIDEBAR - UPLOAD PDFs
 # ================================
-uploaded_files = st.file_uploader(
-    "Upload PDF papers",
-    type="pdf",
+st.sidebar.header("📂 Upload PDFs")
+pdf_files = st.sidebar.file_uploader(
+    "Upload research papers",
+    type=["pdf"],
     accept_multiple_files=True
 )
 
-if uploaded_files:
-    with st.spinner("Processing PDFs..."):
-        text = extract_text_from_pdfs(uploaded_files)
+index = None
+chunks = None
 
-        if not text:
-            st.error("Could not extract text from PDFs.")
-        else:
-            chunks = chunk_text(text)
-            index, embeddings = create_vector_store(chunks, embedder)
+if pdf_files:
+    with st.spinner("Reading PDFs..."):
+        text = extract_text_from_pdfs(pdf_files)
 
-            st.session_state.index = index
-            st.session_state.chunks = chunks
+    with st.spinner("Chunking text..."):
+        chunks = chunk_text(text)
 
-            st.success(f"Processed {len(chunks)} chunks.")
+    with st.spinner("Building vector index..."):
+        index, chunks = build_faiss_index(chunks)
+
+    st.success("Knowledge base ready!")
 
 # ================================
 # CHAT UI
 # ================================
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.write(msg["content"])
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
 
-query = st.chat_input("Ask a question about your papers...")
+user_query = st.text_input("Ask a question about your papers:")
 
-if query:
-    st.session_state.messages.append({"role": "user", "content": query})
+if user_query:
 
-    with st.chat_message("user"):
-        st.write(query)
-
-    if st.session_state.index is None:
-        response = "Please upload PDFs first."
+    if index is None:
+        st.warning("Please upload PDFs first.")
     else:
         with st.spinner("Thinking..."):
-            retrieved_chunks = retrieve(
-                query,
-                embedder,
-                st.session_state.index,
-                st.session_state.chunks
-            )
+            answer = generate_answer(user_query, index, chunks)
 
-            context = "\n\n".join(retrieved_chunks)
+        st.session_state.chat_history.append((user_query, answer))
 
-            # 🔍 DEBUG VIEW (VERY IMPORTANT)
-            with st.expander("🔍 Retrieved Context"):
-                st.write(retrieved_chunks)
 
-            response = generate_response(
-                query,
-                context,
-                tokenizer,
-                model
-            )
-
-    st.session_state.messages.append(
-        {"role": "assistant", "content": response}
-    )
-
-    with st.chat_message("assistant"):
-        st.write(response)
+# ================================
+# DISPLAY CHAT HISTORY
+# ================================
+for q, a in reversed(st.session_state.chat_history):
+    st.markdown(f"**🧑 You:** {q}")
+    st.markdown(f"**🤖 Bot:** {a}")
+    st.markdown("---")
